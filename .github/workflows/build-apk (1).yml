@@ -1,0 +1,152 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Check signing secrets exist
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KS_ALIAS" ]; then
+            echo "::error::Missing secrets. Add KEYSTORE_BASE64, KEYSTORE_PASSWORD and KEY_ALIAS in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "Signing secrets found."
+
+      - name: Pick the newest HTML file in the repo root
+        run: |
+          if [ -f index.html ]; then HTML=index.html; else HTML=$(ls -v *.html 2>/dev/null | tail -n 1); fi
+          if [ -z "$HTML" ]; then echo "No .html file found in repo root. Upload the game file first."; exit 1; fi
+          echo "Using: $HTML"
+          mkdir -p app/www
+          cp "$HTML" app/www/index.html
+
+      - name: Create Capacitor project
+        working-directory: app
+        run: |
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor-firebase/authentication@6 --legacy-peer-deps
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.jalsa.game",
+            "appName": "جلسة",
+            "webDir": "www",
+            "server": { "androidScheme": "https" },
+            "android": { "allowMixedContent": true },
+            "plugins": {
+              "FirebaseAuthentication": {
+                "skipNativeAuth": true,
+                "providers": ["google.com"]
+              }
+            }
+          }
+          EOF
+          npx cap add android
+          printf '\next {\n  rgcfaIncludeGoogle = true\n}\n' >> android/variables.gradle
+          sed -i 's/minSdkVersion = 22/minSdkVersion = 23/' android/variables.gradle
+          grep -n "minSdkVersion\|rgcfaIncludeGoogle" android/variables.gradle
+
+      - name: Add Firebase config
+        run: |
+          if [ -f google-services.json ]; then
+            cp google-services.json app/android/app/google-services.json
+            echo "Firebase config added."
+          else
+            echo "::warning::google-services.json not found in repo root."
+          fi
+
+      - name: Live-update mode (load the game from GitHub Pages if it is online)
+        working-directory: app
+        run: |
+          URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
+          if curl -sfL -o /dev/null "$URL"; then
+            echo "Live mode: $URL"
+            node -e 'const fs=require("fs"),f="capacitor.config.json",c=JSON.parse(fs.readFileSync(f,"utf8"));c.server.url=process.argv[1];fs.writeFileSync(f,JSON.stringify(c,null,2))' "$URL"
+          else
+            echo "Pages is not online yet, bundling the game inside the APK instead."
+          fi
+
+      - name: Add permissions (mic for voice chat)
+        working-directory: app
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's#</manifest>#    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.WAKE_LOCK" />\n</manifest>#' "$M"
+          npx cap sync android
+
+      - name: App icon (uses icon.png from repo root if present)
+        run: |
+          if [ ! -f icon.png ]; then echo "No icon.png found, keeping default icon."; exit 0; fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
+          R=app/android/app/src/main/res
+          rm -f $R/mipmap-*/ic_launcher.* $R/mipmap-*/ic_launcher_round.* $R/mipmap-*/ic_launcher_foreground.*
+          mkdir -p $R/mipmap-anydpi-v26 $R/values
+          for e in mdpi:48:108 hdpi:72:162 xhdpi:96:216 xxhdpi:144:324 xxxhdpi:192:432; do
+            d=${e%%:*}; r=${e#*:}; l=${r%%:*}; f=${r#*:}; i=$((f*64/100))
+            mkdir -p $R/mipmap-$d
+            convert icon.png -resize ${l}x${l} $R/mipmap-$d/ic_launcher.png
+            cp $R/mipmap-$d/ic_launcher.png $R/mipmap-$d/ic_launcher_round.png
+            convert icon.png -resize ${i}x${i} -background none -gravity center -extent ${f}x${f} $R/mipmap-$d/jalsa_fg.png
+          done
+          echo '<?xml version="1.0" encoding="utf-8"?><resources><color name="jalsa_bg">#2A0007</color></resources>' > $R/values/jalsa_bg.xml
+          X='<?xml version="1.0" encoding="utf-8"?><adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android"><background android:drawable="@color/jalsa_bg"/><foreground android:drawable="@mipmap/jalsa_fg"/></adaptive-icon>'
+          echo "$X" > $R/mipmap-anydpi-v26/ic_launcher.xml
+          echo "$X" > $R/mipmap-anydpi-v26/ic_launcher_round.xml
+
+      - name: Set versionCode to the build number
+        working-directory: app/android/app
+        run: |
+          grep -Eq 'versionCode [0-9]+' build.gradle || { echo "::error::versionCode line not found in build.gradle"; exit 1; }
+          sed -i -E "s/versionCode [0-9]+/versionCode ${GITHUB_RUN_NUMBER}/" build.gradle
+          grep -n "versionCode" build.gradle
+
+      - name: Build release APK (unsigned)
+        working-directory: app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK with the permanent key
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BT="$SDK/build-tools/$(ls "$SDK/build-tools" | grep -E '^[0-9.]+$' | sort -V | tail -n 1)"
+          echo "Using build-tools: $BT"
+          IN=$(ls app/android/app/build/outputs/apk/release/*.apk | head -n 1)
+          echo "Input APK: $IN"
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/jalsa.keystore"
+          "$BT/zipalign" -p -f 4 "$IN" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/jalsa.keystore" --ks-pass env:KS_PASS --key-pass env:KS_PASS --ks-key-alias "$KS_ALIAS" --out Jalsa.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs Jalsa.apk
+          rm -f "$RUNNER_TEMP/jalsa.keystore" "$RUNNER_TEMP/aligned.apk"
+
+      - name: Publish APK as a Release (direct download link)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Jalsa APK #${{ github.run_number }}
+          files: Jalsa.apk
